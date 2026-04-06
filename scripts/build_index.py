@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -13,7 +14,13 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-DATA_PATH = "data/processed/car_docs.txt"
+warnings.filterwarnings(
+    "ignore",
+    message=".*clean_up_tokenization_spaces.*",
+    category=FutureWarning,
+)
+
+DATA_PATH = "data/processed/unified_docs.txt"
 INDEX_PATH = "models/faiss_index"
 DOCS_OUT_PATH = "models/docs.txt"
 
@@ -23,7 +30,8 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 def main() -> None:
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(
-            f"Missing dataset file: {DATA_PATH}. Create it or update DATA_PATH."
+            f"Missing dataset file: {DATA_PATH}. Run `python scripts/build_knowledge_base.py` "
+            f"(place CSVs under data/raw/; uses DelucionQA unless --skip-qa) or update DATA_PATH."
         )
 
     with open(DATA_PATH, "r", encoding="utf-8") as f:

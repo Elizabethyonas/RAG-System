@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import warnings
 from typing import List
@@ -59,6 +60,16 @@ def get_llm_device() -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="RAG chat over car_docs FAISS index.")
+    parser.add_argument(
+        "--car",
+        default="",
+        help="Optional car context (model, year, trim). Also set RAG_CAR_CONTEXT env var.",
+    )
+    args = parser.parse_args()
+
+    car_context = (args.car or os.environ.get("RAG_CAR_CONTEXT", "") or "").strip()
+
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     device = get_llm_device()
@@ -66,6 +77,9 @@ def main() -> None:
         print("Using device: cpu (LLM; MPS off by default — set RAG_USE_MPS=1 to try Apple GPU)")
     else:
         print(f"Using device: {device}")
+
+    if car_context:
+        print(f"Car context: {car_context}")
 
     # Load LLM before SentenceTransformer + FAISS to reduce native-library init clashes on macOS.
     tokenizer = AutoTokenizer.from_pretrained(
@@ -89,9 +103,10 @@ def main() -> None:
     embed_model = SentenceTransformer(EMBEDDING_MODEL)
     index, docs = load_faiss_and_docs()
 
-    def retrieve(query: str, k: int = 3) -> List[str]:
+    def retrieve(query: str, k: int = 2, car_context: str = "") -> List[str]:
+        search_query = f"{car_context} {query}".strip() if car_context else query
         q_emb = embed_model.encode(
-            [query],
+            [search_query],
             convert_to_numpy=True,
             normalize_embeddings=False,
         ).astype(np.float32)
@@ -105,12 +120,21 @@ def main() -> None:
                 results.append(docs[i])
         return results
 
-    def generate_answer(query: str) -> str:
-        context_chunks = retrieve(query, k=3)
+    def generate_answer(query: str, car_context: str = "") -> str:
+        context_chunks = retrieve(query, k=2, car_context=car_context)
         context = "\n".join(context_chunks) if context_chunks else "(no relevant context found)"
+        if car_context.strip():
+            context = f"(Vehicle focus: {car_context.strip()})\n\n{context}"
 
         prompt = f"""
-You are a car assistant. Answer based on the context.
+You are a car assistant.
+
+Answer the question using ONLY the information from the context below.
+
+- Do NOT repeat the context
+- Do NOT generate extra questions
+- Give a short, clear answer
+- If the context does not contain the answer, say you do not have that information in the retrieved documents
 
 Context:
 {context}
@@ -118,12 +142,11 @@ Context:
 Question:
 {query}
 
-Answer:
+Final Answer:
 """.strip()
 
         inputs = tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
-
         input_len = inputs["input_ids"].shape[1]
 
         with torch.no_grad():
@@ -135,8 +158,10 @@ Answer:
                 pad_token_id=tokenizer.eos_token_id,
             )
 
-        answer_tokens = outputs[0][input_len:]
-        return tokenizer.decode(answer_tokens, skip_special_tokens=True).strip()
+        full_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if "Final Answer:" in full_output:
+            return full_output.split("Final Answer:")[-1].strip()
+        return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
     # CLI loop
     while True:
@@ -146,7 +171,7 @@ Answer:
         if q.lower() == "exit":
             break
 
-        answer = generate_answer(q)
+        answer = generate_answer(q, car_context=car_context)
         print("\n" + answer)
 
 
