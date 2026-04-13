@@ -95,10 +95,19 @@ class RetrievalConfig:
 
 
 class RAGAssistant:
-    def __init__(self, user_id: str = "user1", car_context: str = "") -> None:
+    def __init__(
+        self,
+        user_id: str = "user1",
+        car_context: str = "",
+        *,
+        use_user_manual: bool = True,
+    ) -> None:
         self.user_id = user_id
         self.car_context = car_context.strip()
-        self.user_model = load_user_meta(user_id)
+        if use_user_manual:
+            self.user_model = load_user_meta(user_id)
+        else:
+            self.user_model = ""
 
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         self.device = get_llm_device()
@@ -121,7 +130,10 @@ class RAGAssistant:
 
         self.embed_model = SentenceTransformer(EMBEDDING_MODEL)
         self.global_index, self.global_docs = load_global_index()
-        self.user_index, self.user_docs = load_user_index(user_id)
+        if use_user_manual:
+            self.user_index, self.user_docs = load_user_index(user_id)
+        else:
+            self.user_index, self.user_docs = None, []
 
     @property
     def has_user_index(self) -> bool:
@@ -274,7 +286,11 @@ def main() -> None:
     args = parser.parse_args()
 
     car_context = (args.car or os.environ.get("RAG_CAR_CONTEXT", "") or "").strip()
-    assistant = RAGAssistant(user_id=args.user_id, car_context=car_context)
+    assistant = RAGAssistant(
+        user_id=args.user_id,
+        car_context=car_context,
+        use_user_manual=True,
+    )
 
     if torch.backends.mps.is_available() and assistant.device == "cpu":
         print("Using device: cpu (LLM; MPS off by default — set RAG_USE_MPS=1 to try Apple GPU)")
