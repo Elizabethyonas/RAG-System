@@ -5,6 +5,7 @@ import warnings
 from pathlib import Path
 
 import pandas as pd
+from pypdf import PdfReader
 
 DEFAULT_OUT = Path("data/processed/unified_docs.txt")
 RAW = Path("data/raw")
@@ -59,6 +60,24 @@ def chunk_words(text: str, size: int) -> list[str]:
     if not words:
         return []
     return [" ".join(words[i : i + size]) for i in range(0, len(words), size)]
+
+
+def process_pdf_text(pdf_path: Path, prefix: str = "") -> list[str]:
+    if not pdf_path.is_file():
+        return []
+    reader = PdfReader(str(pdf_path))
+    pages: list[str] = []
+    for page in reader.pages:
+        txt = (page.extract_text() or "").strip()
+        if txt:
+            pages.append(txt)
+    if not pages:
+        return []
+    merged = "\n".join(pages)
+    chunks = chunk_words(merged, 220)
+    if not prefix:
+        return chunks
+    return [f"{prefix}: {c}" for c in chunks if c]
 
 
 def _norm_cols(df: pd.DataFrame) -> set[str]:
@@ -452,6 +471,12 @@ def main() -> None:
         default=None,
         help="Split name for DelucionQA (default: all splits in the dataset card)",
     )
+    parser.add_argument(
+        "--mdpi-pdf",
+        type=Path,
+        default=None,
+        help="Optional local path to MDPI paper PDF to include as low-priority research context",
+    )
     args = parser.parse_args()
 
     cardekho_paths: list[Path] = []
@@ -517,6 +542,14 @@ def main() -> None:
             all_docs.extend(process_delucionqa(args.qa_split))
         except Exception as e:
             warnings.warn(f"Could not load DelucionQA: {e}", stacklevel=1)
+
+    if args.mdpi_pdf is not None:
+        mdpi_docs = process_pdf_text(args.mdpi_pdf, prefix="Research paper excerpt")
+        if mdpi_docs:
+            all_docs.extend(mdpi_docs)
+            print(f"[load] mdpi pdf: {args.mdpi_pdf.name} ({len(mdpi_docs)} chunks)")
+        else:
+            print(f"[skip] mdpi pdf: no extractable text in {args.mdpi_pdf}")
 
     chunked: list[str] = []
     for doc in all_docs:
