@@ -1,4 +1,4 @@
-## RAG Car Driver Assistant 
+### RAG Car Driver Assistant 
 
 This repo implements a minimal Retrieval-Augmented Generation (RAG) pipeline:
 
