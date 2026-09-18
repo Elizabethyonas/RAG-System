@@ -125,6 +125,7 @@ def evaluate(
         "low_similarity_threshold": low_threshold,
         "low_similarity_count": len(low_cases),
         "low_similarity_examples": low_cases[:10],
+        "per_sample": rows,
     }
 
 
@@ -158,6 +159,11 @@ def main() -> None:
         default=Path("models/eval_report.json"),
         help="Where to save JSON report",
     )
+    parser.add_argument(
+        "--no-per-sample",
+        action="store_true",
+        help="Omit per-sample rows from JSON (smaller report; low-score examples still included)",
+    )
     args = parser.parse_args()
 
     report = evaluate(
@@ -169,17 +175,25 @@ def main() -> None:
         include_user_manual=args.include_user_manual,
     )
 
+    if args.no_per_sample:
+        report.pop("per_sample", None)
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
+    n = report["samples_evaluated"]
+    low = report["low_similarity_count"]
+    thresh = report["low_similarity_threshold"]
+    pct = (100.0 * low / n) if n else 0.0
+
     print("Evaluation complete")
     print(f"- Dataset split      : {report['split']}")
-    print(f"- Samples evaluated  : {report['samples_evaluated']}")
+    print(f"- Samples evaluated  : {n}")
     print(f"- Mean similarity    : {report['mean_similarity']:.3f}")
     print(f"- Median similarity  : {report['median_similarity']:.3f}")
     print(f"- P10 / P90          : {report['p10_similarity']:.3f} / {report['p90_similarity']:.3f}")
-    print(f"- Low-score examples : {report['low_similarity_count']} (< {report['low_similarity_threshold']})")
+    print(f"- Low-score (<{thresh})   : {low} / {n}  (~{pct:.0f}%)")
     print(f"- Report saved       : {args.out}")
 
 
