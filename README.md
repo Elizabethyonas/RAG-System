@@ -82,11 +82,24 @@ uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 
 ### Authentication
 
-User identity comes from a JWT (recommended for Flutter production), not from the request body.
+User identity comes from a JWT, not from the request body.
 
-- Set `JWT_SECRET` (HS256 by default). Send `Authorization: Bearer <token>` where the payload includes `"sub": "<your-user-id>"`.
-- Optional: `JWT_ALGORITHM` (default `HS256`), `JWT_AUDIENCE`, `JWT_ISSUER` if you issue tokens with those claims.
-- **Local dev** (no `JWT_SECRET`): send header `X-User-Id: user1` instead. Do not deploy without `JWT_SECRET` if the API is exposed.
+The Next.js app (`rag-driver-assistant-frontend`) calls these unauthenticated:
+
+- `POST /auth/register` — body `{ "email", "password", "name" }`
+- `POST /auth/login` — body `{ "email", "password" }`
+
+Both return `{ "access_token", "token_type": "bearer", "user": { "id", "email", "name" } }`.
+The JWT `sub` (and `id`) is `user.id`, which is the same id `/sessions` scopes history to.
+Send that token as `Authorization: Bearer <access_token>` on chat routes.
+
+- `GET /auth/me` — current user (Bearer or `access_token` cookie)
+- `POST /auth/logout` — clears the optional HttpOnly cookie (the web client stores the JWT in localStorage)
+
+Also:
+
+- Set `JWT_SECRET` (HS256 by default). Optional: `JWT_ALGORITHM`, `JWT_AUDIENCE`, `JWT_ISSUER`, `JWT_EXPIRE_MINUTES` (default 7 days).
+- **Local dev** (no `JWT_SECRET`): register/login still issue tokens signed with a local-only secret. You can also send `X-User-Id: user1` instead of a JWT. Do not deploy without `JWT_SECRET` if the API is exposed.
 
 ### Endpoints
 

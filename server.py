@@ -1,25 +1,31 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
-from contextlib import asynccontextmanager
 import os
+import re
+import secrets
 import traceback
 import uuid
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal
 
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from database import (
     ChatMessageModel,
     ChatSessionModel,
+    RagUserModel,
+    AuthSessionLocal,
     SessionLocal,
     ensure_chat_schema,
     session_for_prisma_reads,
@@ -37,33 +43,95 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "").strip() or None
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "").strip() or None
+# Used only when JWT_SECRET is unset so local register/login can still issue tokens
+# that /sessions will accept. Set JWT_SECRET in any exposed environment.
+_DEV_JWT_SECRET = "dev-jwt-secret-do-not-use-in-production"
+JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", str(60 * 24 * 7)))
+AUTH_COOKIE_NAME = "access_token"
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PBKDF2_ITERATIONS = 210_000
 
 bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _jwt_signing_secret() -> str:
+    return JWT_SECRET or _DEV_JWT_SECRET
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS
+    )
+    return f"pbkdf2_sha256${_PBKDF2_ITERATIONS}${salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iterations_s, salt, digest_hex = stored.split("$", 3)
+        iterations = int(iterations_s)
+    except (ValueError, TypeError):
+        return False
+    if algo != "pbkdf2_sha256" or iterations < 1:
+        return False
+    expected = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations
+    )
+    return hmac.compare_digest(expected.hex(), digest_hex)
+
+
+def create_access_token(*, user_id: str, email: str, name: str) -> str:
+    now = utcnow()
+    payload: Dict[str, Any] = {
+        "sub": user_id,
+        "id": user_id,
+        "email": email,
+        "name": name,
+        "iat": now,
+        "exp": now + timedelta(minutes=JWT_EXPIRE_MINUTES),
+    }
+    if JWT_AUDIENCE:
+        payload["aud"] = JWT_AUDIENCE
+    if JWT_ISSUER:
+        payload["iss"] = JWT_ISSUER
+    return jwt.encode(payload, _jwt_signing_secret(), algorithm=JWT_ALGORITHM)
+
+
+def _decode_access_token(token: str) -> str:
+    decode_kwargs: Dict[str, Any] = {"algorithms": [JWT_ALGORITHM]}
+    if JWT_AUDIENCE:
+        decode_kwargs["audience"] = JWT_AUDIENCE
+    if JWT_ISSUER:
+        decode_kwargs["issuer"] = JWT_ISSUER
+    try:
+        payload = jwt.decode(token, _jwt_signing_secret(), **decode_kwargs)
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}") from e
+    user_id = payload.get("sub") or payload.get("id")
+    if not user_id or not str(user_id).strip():
+        raise HTTPException(status_code=401, detail="Token missing 'sub' (or 'id') claim.")
+    return str(user_id).strip()
 
 
 def get_current_user_id(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     x_user_id: Annotated[str | None, Header(alias="X-User-Id")] = None,
+    access_token_cookie: Annotated[str | None, Cookie(alias=AUTH_COOKIE_NAME)] = None,
 ) -> str:
+    token: str | None = None
+    if credentials is not None and credentials.scheme.lower() == "bearer" and credentials.credentials:
+        token = credentials.credentials
+    elif access_token_cookie and access_token_cookie.strip():
+        token = access_token_cookie.strip()
+
+    if token:
+        return _decode_access_token(token)
+
     if JWT_SECRET:
-        if credentials is None or credentials.scheme.lower() != "bearer":
-            raise HTTPException(
-                status_code=401,
-                detail="Missing or invalid Authorization header (Bearer token required).",
-            )
-        try:
-            decode_kwargs: Dict[str, Any] = {"algorithms": [JWT_ALGORITHM]}
-            if JWT_AUDIENCE:
-                decode_kwargs["audience"] = JWT_AUDIENCE
-            if JWT_ISSUER:
-                decode_kwargs["issuer"] = JWT_ISSUER
-            payload = jwt.decode(credentials.credentials, JWT_SECRET, **decode_kwargs)
-        except jwt.PyJWTError as e:
-            raise HTTPException(status_code=401, detail=f"Invalid token: {e}") from e
-        user_id = payload.get("sub") or payload.get("id")
-        if not user_id or not str(user_id).strip():
-            raise HTTPException(status_code=401, detail="Token missing 'sub' (or 'id') claim.")
-        return str(user_id).strip()
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid Authorization header (Bearer token required).",
+        )
 
     if x_user_id and x_user_id.strip():
         return x_user_id.strip()
@@ -71,6 +139,97 @@ def get_current_user_id(
         status_code=401,
         detail="Set JWT_SECRET and send Authorization: Bearer <jwt>, or for local dev send X-User-Id.",
     )
+
+
+def _cookie_secure(request: Request) -> bool:
+    raw = os.environ.get("COOKIE_SECURE", "").strip().lower()
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    return request.url.scheme == "https"
+
+
+def _set_auth_cookie(response: Response, request: Request, token: str) -> None:
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(request),
+        max_age=JWT_EXPIRE_MINUTES * 60,
+        path="/",
+    )
+
+
+def _clear_auth_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(
+        key=AUTH_COOKIE_NAME,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(request),
+    )
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=8, max_length=128)
+    name: str
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        email = value.strip().lower()
+        if not _EMAIL_RE.match(email):
+            raise ValueError("Enter a valid email address.")
+        return email
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        name = " ".join(value.split())
+        if len(name) < 2:
+            raise ValueError("Name must be at least 2 characters.")
+        if len(name) > 255:
+            raise ValueError("Name is too long.")
+        return name
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        return value.strip().lower()
+
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    name: str | None = None
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+def _user_out(user: RagUserModel) -> UserOut:
+    return UserOut(id=user.id, email=user.email, name=user.name or None)
+
+
+def _auth_response(user: RagUserModel) -> AuthResponse:
+    token = create_access_token(user_id=user.id, email=user.email, name=user.name or "")
+    return AuthResponse(access_token=token, token_type="bearer", user=_user_out(user))
+
+
+def _get_user_by_id(user_id: str) -> RagUserModel | None:
+    with AuthSessionLocal() as db:
+        return db.get(RagUserModel, user_id)
 
 
 class VehicleHealthComponent(BaseModel):
@@ -521,6 +680,66 @@ def root() -> Dict[str, str]:
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/auth/register", response_model=AuthResponse)
+def register(payload: RegisterRequest, request: Request, response: Response) -> AuthResponse:
+    user = RagUserModel(
+        id=str(uuid.uuid4()),
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        name=payload.name,
+        created_at=utcnow(),
+    )
+    try:
+        with AuthSessionLocal() as db:
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            stored = RagUserModel(
+                id=user.id,
+                email=user.email,
+                password_hash=user.password_hash,
+                name=user.name,
+            )
+    except IntegrityError:
+        raise HTTPException(status_code=409, detail="Email already registered") from None
+
+    body = _auth_response(stored)
+    _set_auth_cookie(response, request, body.access_token)
+    return body
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login(payload: LoginRequest, request: Request, response: Response) -> AuthResponse:
+    with AuthSessionLocal() as db:
+        user = db.scalars(select(RagUserModel).where(RagUserModel.email == payload.email)).first()
+        if user is None or not verify_password(payload.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        stored = RagUserModel(
+            id=user.id,
+            email=user.email,
+            password_hash=user.password_hash,
+            name=user.name,
+        )
+
+    body = _auth_response(stored)
+    _set_auth_cookie(response, request, body.access_token)
+    return body
+
+
+@app.get("/auth/me", response_model=UserOut)
+def auth_me(user_id: Annotated[str, Depends(get_current_user_id)]) -> UserOut:
+    user = _get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return _user_out(user)
+
+
+@app.post("/auth/logout")
+def logout(request: Request, response: Response) -> Dict[str, bool]:
+    _clear_auth_cookie(response, request)
+    return {"ok": True}
 
 
 @app.post("/sessions", response_model=ChatSessionResponse)

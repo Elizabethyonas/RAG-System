@@ -26,8 +26,11 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 Set these in Render service settings:
 
-- `DATABASE_URL`: `postgresql+psycopg://<user>:<pass>@<host>:<port>/<db>`
+- `DATABASE_URL`: `postgresql+psycopg://<user>:<pass>@<direct-host>/<db>?sslmode=require`
+  - SQLAlchemy needs `postgresql+psycopg://`, not the Prisma/Neon `postgresql://` form.
+  - On Neon, use the **direct** host (no `-pooler`). The pooler is for short serverless queries, not pgvector + bulk inserts.
 - `JWT_SECRET`: strong random secret (required for production auth)
+- `LLM_PROVIDER=hf_space` (do not run Qwen 3B on a Render Starter instance)
 
 Defaults already in `render.yaml`:
 
@@ -45,10 +48,12 @@ Optional auth hardening:
 After deploy, run in a Render Shell (or local machine with the same env vars):
 
 ```bash
-python scripts/build_index.py
+python scripts/build_index.py --batch-size 200
+# If a previous load died mid-way (Neon SSL drop), continue without wiping rows:
+python scripts/build_index.py --resume --batch-size 200
 ```
 
-This populates `rag_kb_chunks` in Postgres for retrieval.
+This populates `rag_kb_chunks` in Postgres for retrieval. A full 179k-chunk load to Neon can take a while; embeddings are reused from `models/global_embeddings.npy` when present.
 
 ## 5) Sync manuals (optional)
 

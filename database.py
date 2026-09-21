@@ -110,12 +110,29 @@ class RagUserProfileModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class RagUserModel(Base):
+    """Accounts for the Next.js web app. ``id`` is the JWT ``sub`` used by chat_sessions.user_id."""
+
+    __tablename__ = "rag_users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    name: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 engine = create_engine(
     DATABASE_URL,
     future=True,
     pool_pre_ping=True,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+
+# rag_users lives on the primary DB when possible. If that CREATE fails (e.g. Neon
+# disk-full), accounts fall back to a local SQLite file so register/login still work.
+_auth_engine = engine
+AuthSessionLocal = SessionLocal
 
 # Optional second Postgres URL for Prisma tables (e.g. EducationContent) when the RAG stack
 # uses a different database than driver-garage-backend (Docker pgvector vs local Express DB).
@@ -174,24 +191,48 @@ def _postgres_enable_vector(dbapi_connection: Any, _connection_record: Any) -> N
 
 def create_all_tables() -> None:
     """Create chat tables always; KB tables only when Postgres + pgvector is available."""
-    if is_postgres_url(DATABASE_URL) and Vector is not None:
-        Base.metadata.create_all(
-            engine,
-            tables=[
-                ChatSessionModel.__table__,
-                ChatMessageModel.__table__,
-                RagKbChunkModel.__table__,
-                RagUserProfileModel.__table__,
-            ],
+    chat_tables = [
+        ChatSessionModel.__table__,
+        ChatMessageModel.__table__,
+    ]
+    try:
+        if is_postgres_url(DATABASE_URL) and Vector is not None:
+            Base.metadata.create_all(
+                engine,
+                tables=[
+                    *chat_tables,
+                    RagKbChunkModel.__table__,
+                    RagUserProfileModel.__table__,
+                ],
+            )
+        else:
+            Base.metadata.create_all(engine, tables=chat_tables)
+    except Exception as exc:
+        _log.warning("create_all_tables (chat/kb) failed: %s", exc)
+    _ensure_rag_users_table()
+
+
+def _ensure_rag_users_table() -> None:
+    """Create rag_users on the primary engine, or SQLite if the primary DB cannot grow."""
+    global _auth_engine, AuthSessionLocal
+    try:
+        Base.metadata.create_all(engine, tables=[RagUserModel.__table__])
+        _auth_engine = engine
+        AuthSessionLocal = SessionLocal
+        return
+    except Exception as exc:
+        _log.warning(
+            "Could not create rag_users on primary DB (%s); using local SQLite for accounts.",
+            exc,
         )
-    else:
-        Base.metadata.create_all(
-            engine,
-            tables=[
-                ChatSessionModel.__table__,
-                ChatMessageModel.__table__,
-            ],
-        )
+
+    auth_path = Path(__file__).resolve().parent / "models" / "auth.db"
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    _auth_engine = create_engine(f"sqlite:///{auth_path}", future=True, pool_pre_ping=True)
+    AuthSessionLocal = sessionmaker(
+        bind=_auth_engine, autoflush=False, autocommit=False, expire_on_commit=False
+    )
+    Base.metadata.create_all(_auth_engine, tables=[RagUserModel.__table__])
 
 
 def ensure_chat_schema() -> None:
