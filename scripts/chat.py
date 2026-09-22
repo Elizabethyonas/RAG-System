@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,33 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from database import RagUserProfileModel, SessionLocal
+
+
+def _patch_transformers_mps_isin() -> None:
+    """Torch 2.2 on Apple GPU crashes inside transformers when the pad token is a scalar.
+
+    ``isin_mps_friendly`` indexes ``test_elements.shape[0]``. A 0-dim pad token has no
+    dimension 0, so ``generate()`` raises IndexError and the chat request returns 500.
+    """
+    import transformers.generation.utils as gen_utils
+    import transformers.pytorch_utils as pt_utils
+
+    original = pt_utils.isin_mps_friendly
+    if getattr(original, "_rag_mps_patch", False):
+        return
+
+    def isin_mps_friendly(elements: torch.Tensor, test_elements: torch.Tensor | int) -> torch.Tensor:
+        if isinstance(test_elements, torch.Tensor) and test_elements.ndim == 0:
+            test_elements = test_elements.reshape(1)
+        return original(elements, test_elements)
+
+    isin_mps_friendly._rag_mps_patch = True  # type: ignore[attr-defined]
+    pt_utils.isin_mps_friendly = isin_mps_friendly
+    gen_utils.isin_mps_friendly = isin_mps_friendly
+
+
+_patch_transformers_mps_isin()
+
 from rag_kb import count_user_chunks, kb_pgvector_enabled, search_kb_l2
 
 warnings.filterwarnings(
@@ -151,14 +179,71 @@ def load_user_meta(user_id: str) -> str:
 
 
 def get_llm_device() -> str:
-    """Pick device for the causal LM."""
+    """Pick device for the causal LM.
+
+    Apple GPU is the default on Macs. CPU inference of the 3B model is
+    single-threaded (OpenMP is pinned to 1 to avoid a macOS crash) and takes
+    minutes per reply. Set RAG_USE_MPS=0 to force CPU.
+    """
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
-        if os.environ.get("RAG_USE_MPS", "").lower() in ("1", "true", "yes"):
+        flag = os.environ.get("RAG_USE_MPS", "1").strip().lower()
+        if flag not in ("0", "false", "no", "off"):
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
             return "mps"
         return "cpu"
     return "cpu"
+
+
+_llm_load_lock = threading.Lock()
+_shared_local_llm: tuple[str, str, object, object] | None = None
+
+
+def _get_shared_local_llm(device: str) -> tuple[str, object, object]:
+    """Load causal-LM weights once and reuse them across RAGAssistant instances."""
+    global _shared_local_llm
+    with _llm_load_lock:
+        if _shared_local_llm is not None and _shared_local_llm[1] == device:
+            name, _, tokenizer, model = _shared_local_llm
+            return name, tokenizer, model
+
+        if device == "cuda":
+            torch_dtype = torch.float16
+        elif device == "mps":
+            torch_dtype = torch.float16
+        else:
+            torch_dtype = None
+
+        load_errors: List[str] = []
+        for candidate_model in [LLM_MODEL, FALLBACK_LLM_MODEL]:
+            if not candidate_model:
+                continue
+            try:
+                print(f"Loading LLM {candidate_model} on {device}...", flush=True)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    candidate_model,
+                    clean_up_tokenization_spaces=False,
+                )
+                if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+                    tokenizer.pad_token_id = tokenizer.eos_token_id
+                model = AutoModelForCausalLM.from_pretrained(
+                    candidate_model,
+                    torch_dtype=torch_dtype,
+                ).to(device)
+                model.eval()
+                gen_cfg = model.generation_config
+                gen_cfg.do_sample = False
+                gen_cfg.top_k = None
+                gen_cfg.top_p = None
+                _shared_local_llm = (candidate_model, device, tokenizer, model)
+                print(f"LLM ready: {candidate_model} on {device}", flush=True)
+                return candidate_model, tokenizer, model
+            except Exception as e:  # pragma: no cover - runtime/network dependent
+                load_errors.append(f"{candidate_model}: {e}")
+
+        msg = " | ".join(load_errors) if load_errors else "Unknown model loading failure"
+        raise RuntimeError(f"Failed to load any LLM model. {msg}")
 
 
 @dataclass
@@ -291,38 +376,7 @@ class RAGAssistant:
             self.llm = None
             self.tokenizer = None
         else:
-            if self.device == "cuda":
-                torch_dtype = torch.float16
-            elif self.device == "mps":
-                torch_dtype = torch.float32
-            else:
-                torch_dtype = None
-
-            self.active_llm_model = ""
-            load_errors: List[str] = []
-            for candidate_model in [LLM_MODEL, FALLBACK_LLM_MODEL]:
-                if not candidate_model or candidate_model in {self.active_llm_model}:
-                    continue
-                try:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        candidate_model,
-                        clean_up_tokenization_spaces=False,
-                    )
-                    if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
-                        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-                    self.llm = AutoModelForCausalLM.from_pretrained(
-                        candidate_model,
-                        torch_dtype=torch_dtype,
-                    ).to(self.device)
-                    self.llm.eval()
-                    self.active_llm_model = candidate_model
-                    break
-                except Exception as e:  # pragma: no cover - runtime/network dependent
-                    load_errors.append(f"{candidate_model}: {e}")
-
-            if not self.active_llm_model:
-                msg = " | ".join(load_errors) if load_errors else "Unknown model loading failure"
-                raise RuntimeError(f"Failed to load any LLM model. {msg}")
+            self.active_llm_model, self.tokenizer, self.llm = _get_shared_local_llm(self.device)
 
         self.embed_model = _get_shared_sentence_transformer()
 
@@ -644,16 +698,35 @@ Answer:
             blocks.append(f"(Most recent messages)\n{recent}")
         return "\n\n".join(blocks).strip()
 
+    def _heuristic_chat_summary(self, prev: str, user_text: str, assistant_text: str) -> str:
+        parts: List[str] = []
+        if prev:
+            parts.append(prev)
+        u = re.sub(r"\s+", " ", user_text).strip()
+        a = re.sub(r"\s+", " ", assistant_text).strip()
+        if u:
+            parts.append(f"User: {u[:180]}")
+        if a:
+            parts.append(f"Assistant: {a[:220]}")
+        updated = "\n".join(parts)
+        if len(updated) > 1200:
+            updated = updated[-1200:]
+        return updated.strip()
+
     def update_chat_summary(self, prev_summary: str, user_text: str, assistant_text: str) -> str:
         """
         Rolling summary for long chats.
-        Uses the configured LLM provider when available; falls back to a compact heuristic on failures.
+
+        Remote providers still use the LLM. A local model does not: a second
+        generation was running before the HTTP response and added minutes.
         """
         prev = (prev_summary or "").strip()
         u = (user_text or "").strip()
         a = (assistant_text or "").strip()
         if not u and not a:
             return prev[:1400]
+        if self.llm is not None:
+            return self._heuristic_chat_summary(prev, u, a)
 
         prompt = f"""
 You maintain a rolling conversation summary for a car-care assistant.
@@ -698,13 +771,7 @@ Updated summary:
                 else:
                     updated = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
         except Exception:
-            # Heuristic fallback: keep a compact running log.
-            parts: List[str] = []
-            if prev:
-                parts.append(prev)
-            parts.append(f"User: {re.sub(r'\\s+', ' ', u)[:180]}")
-            parts.append(f"Assistant: {re.sub(r'\\s+', ' ', a)[:220]}")
-            updated = "\n".join(parts)
+            updated = self._heuristic_chat_summary(prev, u, a)
 
         updated = re.sub(r"\s+\n", "\n", (updated or "").strip())
         updated = "\n".join([ln.strip() for ln in updated.splitlines() if ln.strip()])
@@ -985,10 +1052,7 @@ def main() -> None:
         use_user_manual=True,
     )
 
-    if torch.backends.mps.is_available() and assistant.device == "cpu":
-        print("Using device: cpu (set RAG_USE_MPS=1 to try Apple GPU)")
-    else:
-        print(f"Using device: {assistant.device}")
+    print(f"Using device: {assistant.device}")
     print(f"LLM model requested: {LLM_MODEL}")
     print(f"LLM fallback model: {FALLBACK_LLM_MODEL}")
     print(f"LLM model loaded: {assistant.active_llm_model}")

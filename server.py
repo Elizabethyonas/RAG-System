@@ -313,8 +313,10 @@ class ChatMessageResponse(BaseModel):
 _assistant_cache: Dict[str, RAGAssistant] = {}
 
 
-def build_assistant_key(user_id: str, car_context: str, use_user_manual: bool) -> str:
-    return f"{user_id}::{car_context.strip()}::{use_user_manual}"
+def build_assistant_key(user_id: str, _car_context: str, use_user_manual: bool) -> str:
+    # Vehicle text is passed into generate_answer on each request. Keying the
+    # cache on it built a new assistant (and reloaded the LLM) whenever it changed.
+    return f"{user_id}::{use_user_manual}"
 
 
 def get_assistant(user_id: str, car_context: str, use_user_manual: bool) -> RAGAssistant:
@@ -646,14 +648,6 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="RAG Chat History API", version="1.0.0", lifespan=_lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 @app.middleware("http")
 async def unhandled_exception_logger(request: Request, call_next):
@@ -670,6 +664,17 @@ async def unhandled_exception_logger(request: Request, call_next):
             payload["type"] = type(exc).__name__
             payload["trace"] = traceback.format_exc()[-8000:]
         return JSONResponse(status_code=500, content=payload)
+
+
+# Registered after the error middleware so it stays outermost. Otherwise a 500
+# leaves the browser with no Access-Control-Allow-Origin header.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
