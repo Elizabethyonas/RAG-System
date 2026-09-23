@@ -7,6 +7,11 @@ transformers==4.45.0
 tokenizers==0.20.3
 sentence-transformers==3.0.1
 huggingface-hub==0.31.4
+# Generation runs through llama.cpp on a quantised GGUF; transformers is only the fallback.
+# gguf + sentencepiece are needed to rebuild the GGUF from the HF weights, not to serve it.
+llama-cpp-python==0.3.35
+gguf==0.19.0
+sentencepiece==0.2.2
 hf_xet==1.4.3
 # faiss-cpu==1.8.0.post1 does not publish Python 3.13 wheels; use a newer build.
 faiss-cpu==1.13.2

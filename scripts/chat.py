@@ -6,9 +6,9 @@ import os
 import sys
 import threading
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, Iterator, List, Sequence
 import re
 
 import requests
@@ -24,13 +24,17 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import torch
 
-torch.set_num_threads(1)
+# OpenMP stays pinned to one thread (see above), but torch's own intra-op pool is safe to widen
+# and generation is several times faster for it. Set RAG_TORCH_THREADS=1 to restore the old
+# single-threaded behaviour.
+_torch_threads = int(os.environ.get("RAG_TORCH_THREADS", "0") or 0) or (os.cpu_count() or 1)
+torch.set_num_threads(max(1, _torch_threads))
 
 import faiss
 import numpy as np
 from gradio_client import Client
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 from database import RagUserProfileModel, SessionLocal
 
@@ -103,6 +107,13 @@ FALLBACK_LLM_MODEL = os.environ.get(
 REMOTE_LLM_URL = os.environ.get("RAG_REMOTE_LLM_URL", "").strip()
 REMOTE_LLM_SECRET = os.environ.get("RAG_REMOTE_LLM_SECRET", "").strip()
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "").strip().lower()
+
+# llama.cpp (GGUF) path. Quantised weights run several times faster than fp16 transformers on
+# CPU, which matters on Intel Macs where torch is capped at 2.2.x and the Metal backend is slower
+# than the CPU. Set RAG_GGUF_MODEL to a .gguf file to use it instead of transformers.
+GGUF_MODEL_PATH = os.environ.get("RAG_GGUF_MODEL", "").strip()
+GGUF_THREADS = int(os.environ.get("RAG_GGUF_THREADS", "0") or 0) or (os.cpu_count() or 4)
+GGUF_CONTEXT = int(os.environ.get("RAG_GGUF_CONTEXT", "4096") or 4096)
 HF_SPACE_ID = os.environ.get("HF_SPACE_ID", "").strip()
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "").strip()
 HF_SPACE_API_NAME = os.environ.get("HF_SPACE_API_NAME", "/predict").strip() or "/predict"
@@ -199,6 +210,48 @@ def get_llm_device() -> str:
 _llm_load_lock = threading.Lock()
 _shared_local_llm: tuple[str, str, object, object] | None = None
 
+_gguf_load_lock = threading.Lock()
+# llama.cpp holds one mutable context per model, so generations must not overlap.
+_gguf_generate_lock = threading.Lock()
+_shared_gguf_llm: object | None = None
+
+
+def use_gguf_llm() -> bool:
+    return bool(GGUF_MODEL_PATH) and LLM_PROVIDER in ("", "llama_cpp", "gguf")
+
+
+def _get_shared_gguf_llm() -> object:
+    """Load the quantised model once and reuse it across RAGAssistant instances."""
+    global _shared_gguf_llm
+    with _gguf_load_lock:
+        if _shared_gguf_llm is not None:
+            return _shared_gguf_llm
+
+        try:
+            from llama_cpp import Llama
+        except ImportError as e:
+            raise RuntimeError(
+                "RAG_GGUF_MODEL is set but llama-cpp-python is not installed "
+                "(pip install llama-cpp-python)."
+            ) from e
+
+        path = Path(GGUF_MODEL_PATH).expanduser()
+        if not path.is_file():
+            raise RuntimeError(f"RAG_GGUF_MODEL does not point at a file: {path}")
+
+        print(
+            f"Loading GGUF {path.name} (threads={GGUF_THREADS}, ctx={GGUF_CONTEXT})...",
+            flush=True,
+        )
+        _shared_gguf_llm = Llama(
+            model_path=str(path),
+            n_ctx=GGUF_CONTEXT,
+            n_threads=GGUF_THREADS,
+            verbose=False,
+        )
+        print(f"LLM ready: {path.name} (llama.cpp)", flush=True)
+        return _shared_gguf_llm
+
 
 def _get_shared_local_llm(device: str) -> tuple[str, object, object]:
     """Load causal-LM weights once and reuse them across RAGAssistant instances."""
@@ -251,6 +304,78 @@ class RetrievalConfig:
     k_user: int = 2
     k_global: int = 3
 
+
+@dataclass
+class _AnswerPlan:
+    """Everything `generate_answer` needs after retrieval, so the streaming path can reuse it.
+
+    ``direct`` is set for replies that never reach the LLM (smalltalk, identity, vehicle status).
+    """
+
+    direct: str | None = None
+    prompt: str = ""
+    snap: str = ""
+    active_context: str = ""
+    context_chunks: List[str] = field(default_factory=list)
+    max_new_tokens: int = 96
+
+
+# The prompt ends with "Answer:", so anything the model writes afterwards that looks like a new
+# prompt section is the model continuing the template instead of answering.
+_STREAM_STOP_MARKERS = ("Question:", "Context:")
+
+# Longest marker, minus one: the most text that could still turn out to be a marker prefix.
+_MARKER_HOLDBACK = max(len(m) for m in _STREAM_STOP_MARKERS) - 1
+
+
+class _StreamingAnswerFilter:
+    """Forwards generated text as it arrives, withholding only a possible template marker.
+
+    Text is emitted as soon as it cannot be the start of a stop marker, which keeps
+    time-to-first-token low. Output is provisional: ``_format_answer`` dedupes lines and can
+    replace the reply outright, so callers must send the finalized text afterwards.
+    """
+
+    def __init__(self) -> None:
+        self.raw = ""
+        self.stopped = False
+        self._pending = ""
+
+    def push(self, piece: str) -> List[str]:
+        if self.stopped:
+            return []
+        self.raw += piece
+        self._pending += piece
+
+        for marker in _STREAM_STOP_MARKERS:
+            idx = self._pending.find(marker)
+            if idx != -1:
+                out, self._pending = self._pending[:idx], ""
+                self.stopped = True
+                return [out] if out else []
+
+        if len(self._pending) <= _MARKER_HOLDBACK:
+            return []
+        out, self._pending = (
+            self._pending[:-_MARKER_HOLDBACK],
+            self._pending[-_MARKER_HOLDBACK:],
+        )
+        return [out] if out else []
+
+    def flush(self) -> str:
+        if self.stopped or not self._pending:
+            return ""
+        out, self._pending = self._pending, ""
+        return out
+
+
+# Exposed for latency tuning, but note that shrinking them does not help: cutting history to
+# 2 messages / 200 chars / 600 chars of summary was measured over two 6-turn sessions and moved
+# time-to-first-token by less than the run-to-run noise. Prompt size does drive latency, but the
+# variable part is the retrieved context (~880-2400 chars), not the history block.
+HISTORY_MESSAGES = int(os.environ.get("RAG_HISTORY_MESSAGES", "4") or 4)
+HISTORY_MESSAGE_CHARS = int(os.environ.get("RAG_HISTORY_MESSAGE_CHARS", "320") or 320)
+HISTORY_SUMMARY_CHARS = int(os.environ.get("RAG_HISTORY_SUMMARY_CHARS", "1400") or 1400)
 
 CARCARE_PERSONA_PROMPT = """
 You are CarCare AI, a practical and safety-first assistant for drivers.
@@ -363,12 +488,19 @@ class RAGAssistant:
         self.hf_space_url = HF_SPACE_URL
         self.hf_space_api_name = HF_SPACE_API_NAME
         self.device = get_llm_device()
+        self.use_gguf = use_gguf_llm()
 
         if self.llm_provider == "hf_space":
             target = self.hf_space_id or self.hf_space_url or "(missing HF_SPACE_ID/HF_SPACE_URL)"
             self.active_llm_model = f"hf_space:{target}"
             self.llm = None
             self.tokenizer = None
+        elif self.use_gguf:
+            # Skips the transformers weights entirely; llama.cpp owns tokenisation too.
+            self.active_llm_model = f"llama_cpp:{Path(GGUF_MODEL_PATH).name}"
+            self.llm = None
+            self.tokenizer = None
+            _get_shared_gguf_llm()
         elif self.remote_llm_url:
             # Defer generation to a remote service (e.g. Colab). This avoids loading local
             # transformer weights on constrained hosts (Render free/CPU instances).
@@ -669,7 +801,7 @@ Answer:
         if not recent_messages:
             return ""
         lines: List[str] = []
-        for m in list(recent_messages)[-6:]:
+        for m in list(recent_messages)[-HISTORY_MESSAGES:]:
             role = (m.get("role") or "").strip().lower()
             content = (m.get("content") or "").strip()
             if not content:
@@ -678,8 +810,8 @@ Answer:
                 role = "user"
             clipped = content.replace("\n", " ").strip()
             clipped = re.sub(r"\s+", " ", clipped)
-            if len(clipped) > 320:
-                clipped = clipped[:317].rstrip() + "..."
+            if len(clipped) > HISTORY_MESSAGE_CHARS:
+                clipped = clipped[: HISTORY_MESSAGE_CHARS - 3].rstrip() + "..."
             lines.append(f"{role}: {clipped}")
         return "\n".join(lines).strip()
 
@@ -693,7 +825,7 @@ Answer:
         recent = self._format_recent_messages(recent_messages)
         blocks: List[str] = []
         if summary:
-            blocks.append(f"(Conversation summary so far)\n{summary[:1400]}")
+            blocks.append(f"(Conversation summary so far)\n{summary[-HISTORY_SUMMARY_CHARS:]}")
         if recent:
             blocks.append(f"(Most recent messages)\n{recent}")
         return "\n\n".join(blocks).strip()
@@ -725,7 +857,7 @@ Answer:
         a = (assistant_text or "").strip()
         if not u and not a:
             return prev[:1400]
-        if self.llm is not None:
+        if self.llm is not None or self.use_gguf:
             return self._heuristic_chat_summary(prev, u, a)
 
         prompt = f"""
@@ -875,6 +1007,29 @@ Updated summary:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         return inputs, inputs["input_ids"].shape[1]
 
+    def _gguf_generate(self, prompt: str, max_new_tokens: int) -> str:
+        llm = _get_shared_gguf_llm()
+        with _gguf_generate_lock:
+            out = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_new_tokens,
+                temperature=0.0,
+            )
+        return (out["choices"][0]["message"].get("content") or "").strip()
+
+    def _gguf_stream(self, prompt: str, max_new_tokens: int) -> Iterator[str]:
+        llm = _get_shared_gguf_llm()
+        with _gguf_generate_lock:
+            for chunk in llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_new_tokens,
+                temperature=0.0,
+                stream=True,
+            ):
+                piece = chunk["choices"][0].get("delta", {}).get("content")
+                if piece:
+                    yield piece
+
     def _remote_generate(self, prompt: str) -> str:
         if not self.remote_llm_url:
             raise RuntimeError("Remote LLM URL not configured.")
@@ -920,7 +1075,7 @@ Updated summary:
             return str(result.get("answer") or "").strip()
         return str(result).strip()
 
-    def generate_answer(
+    def _plan_answer(
         self,
         query: str,
         car_context: str = "",
@@ -928,13 +1083,14 @@ Updated summary:
         manual_ids: Sequence[str] | None = None,
         chat_summary: str = "",
         recent_messages: Sequence[Dict[str, str]] | None = None,
-    ) -> str:
+    ) -> _AnswerPlan:
+        """Run the shortcuts and retrieval, and build the prompt. Shared by both answer paths."""
         quick = self._quick_smalltalk(query)
         if quick is not None:
-            return quick
+            return _AnswerPlan(direct=quick)
 
         if _is_identity_or_meta_query(query):
-            return self._identity_intro_reply()
+            return _AnswerPlan(direct=self._identity_intro_reply())
 
         active_context = car_context.strip() if car_context.strip() else self.car_context
         if self.user_model and self.has_user_index:
@@ -958,8 +1114,12 @@ Updated summary:
                     for i, ch in enumerate(context_chunks[:3], 1):
                         excerpt = " ".join(ch.split())[:480]
                         reply += f"\n{i}. {excerpt}"
-                return self._format_answer(reply)
-            return self._format_answer(self._vehicle_status_missing_snapshot_message(active_context))
+                return _AnswerPlan(direct=self._format_answer(reply))
+            return _AnswerPlan(
+                direct=self._format_answer(
+                    self._vehicle_status_missing_snapshot_message(active_context)
+                )
+            )
 
         context_chunks = self.retrieve(
             query,
@@ -990,20 +1150,61 @@ Updated summary:
         mode = self._answer_mode(query)
         prompt = self._build_prompt(context=context, query=query, mode=mode)
 
+        return _AnswerPlan(
+            prompt=prompt,
+            snap=snap,
+            active_context=active_context,
+            context_chunks=list(context_chunks),
+            max_new_tokens=140 if snap else 96,
+        )
+
+    def _finalize_answer(self, answer: str, plan: _AnswerPlan) -> str:
+        answer = answer.split("Question:")[0].split("Context:")[0].strip()
+        answer_lower = answer.lower()
+        if (not answer or "no relevant context" in answer_lower) and plan.snap:
+            blended = self._vehicle_status_reply_from_priority(plan.snap, plan.active_context)
+            if plan.context_chunks:
+                blended += "\n\n—\n**Owner manual excerpts**\n"
+                for i, ch in enumerate(plan.context_chunks[:2], 1):
+                    blended += f"\n{i}. {' '.join(ch.split())[:400]}"
+            return self._format_answer(blended)
+        return self._format_answer(answer)
+
+    def generate_answer(
+        self,
+        query: str,
+        car_context: str = "",
+        priority_context: str = "",
+        manual_ids: Sequence[str] | None = None,
+        chat_summary: str = "",
+        recent_messages: Sequence[Dict[str, str]] | None = None,
+    ) -> str:
+        plan = self._plan_answer(
+            query,
+            car_context=car_context,
+            priority_context=priority_context,
+            manual_ids=manual_ids,
+            chat_summary=chat_summary,
+            recent_messages=recent_messages,
+        )
+        if plan.direct is not None:
+            return plan.direct
+
         if self.llm_provider == "hf_space":
-            answer = self._hf_space_generate(prompt)
+            answer = self._hf_space_generate(plan.prompt)
+        elif self.use_gguf:
+            answer = self._gguf_generate(plan.prompt, plan.max_new_tokens)
         elif self.remote_llm_url:
-            answer = self._remote_generate(prompt)
+            answer = self._remote_generate(plan.prompt)
         else:
             assert self.llm is not None
             assert self.tokenizer is not None
-            inputs, input_len = self._tokenize_for_generation(prompt)
-            max_tokens = 140 if snap else 96
+            inputs, input_len = self._tokenize_for_generation(plan.prompt)
 
             with torch.no_grad():
                 outputs = self.llm.generate(
                     **inputs,
-                    max_new_tokens=max_tokens,
+                    max_new_tokens=plan.max_new_tokens,
                     do_sample=False,
                     temperature=1.0,
                     pad_token_id=self.tokenizer.pad_token_id,
@@ -1017,16 +1218,106 @@ Updated summary:
             else:
                 answer = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
-        answer = answer.split("Question:")[0].split("Context:")[0].strip()
-        answer_lower = answer.lower()
-        if (not answer or "no relevant context" in answer_lower) and snap:
-            blended = self._vehicle_status_reply_from_priority(snap, active_context)
-            if context_chunks:
-                blended += "\n\n—\n**Owner manual excerpts**\n"
-                for i, ch in enumerate(context_chunks[:2], 1):
-                    blended += f"\n{i}. {' '.join(ch.split())[:400]}"
-            return self._format_answer(blended)
-        return self._format_answer(answer)
+        return self._finalize_answer(answer, plan)
+
+    def generate_answer_stream(
+        self,
+        query: str,
+        car_context: str = "",
+        priority_context: str = "",
+        manual_ids: Sequence[str] | None = None,
+        chat_summary: str = "",
+        recent_messages: Sequence[Dict[str, str]] | None = None,
+    ) -> Iterator[tuple[str, str]]:
+        """Yield ``("delta", text)`` as the answer is produced, then one ``("final", text)``.
+
+        Deltas are provisional: `_format_answer` may rewrite or replace the whole reply, so the
+        final event carries the authoritative text and clients should swap it in.
+        """
+        plan = self._plan_answer(
+            query,
+            car_context=car_context,
+            priority_context=priority_context,
+            manual_ids=manual_ids,
+            chat_summary=chat_summary,
+            recent_messages=recent_messages,
+        )
+        if plan.direct is not None:
+            yield "delta", plan.direct
+            yield "final", plan.direct
+            return
+
+        if self.use_gguf:
+            stream_filter = _StreamingAnswerFilter()
+            for piece in self._gguf_stream(plan.prompt, plan.max_new_tokens):
+                for chunk in stream_filter.push(piece):
+                    yield "delta", chunk
+                if stream_filter.stopped:
+                    break
+            tail = stream_filter.flush()
+            if tail:
+                yield "delta", tail
+            yield "final", self._finalize_answer(stream_filter.raw.strip(), plan)
+            return
+
+        # Remote providers return the finished answer in one call; there is nothing to stream.
+        if self.llm_provider == "hf_space" or self.remote_llm_url:
+            raw = (
+                self._hf_space_generate(plan.prompt)
+                if self.llm_provider == "hf_space"
+                else self._remote_generate(plan.prompt)
+            )
+            final = self._finalize_answer(raw, plan)
+            yield "delta", final
+            yield "final", final
+            return
+
+        assert self.llm is not None
+        assert self.tokenizer is not None
+        inputs, _ = self._tokenize_for_generation(plan.prompt)
+        streamer = TextIteratorStreamer(
+            self.tokenizer, skip_prompt=True, skip_special_tokens=True
+        )
+        errors: List[BaseException] = []
+
+        def _run() -> None:
+            try:
+                with torch.no_grad():
+                    self.llm.generate(
+                        **inputs,
+                        max_new_tokens=plan.max_new_tokens,
+                        do_sample=False,
+                        temperature=1.0,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        streamer=streamer,
+                    )
+            except BaseException as exc:  # surfaced below; must not leave the reader blocked
+                errors.append(exc)
+                streamer.end()
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        stream_filter = _StreamingAnswerFilter()
+        for piece in streamer:
+            for chunk in stream_filter.push(piece):
+                yield "delta", chunk
+            if stream_filter.stopped:
+                break
+        thread.join()
+        if errors:
+            raise RuntimeError(f"LLM generation failed: {errors[0]}") from errors[0]
+
+        tail = stream_filter.flush()
+        if tail:
+            yield "delta", tail
+
+        raw = stream_filter.raw
+        if "Answer:" in raw:
+            raw = raw.split("Answer:")[-1]
+        elif "Final Answer:" in raw:
+            raw = raw.split("Final Answer:")[-1]
+        yield "final", self._finalize_answer(raw.strip(), plan)
 
 
 def main() -> None:

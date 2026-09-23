@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -9,13 +10,14 @@ import secrets
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal
 
 import jwt
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select, text
@@ -30,7 +32,7 @@ from database import (
     ensure_chat_schema,
     session_for_prisma_reads,
 )
-from scripts.chat import RAGAssistant
+from scripts.chat import HISTORY_MESSAGES, RAGAssistant
 
 logger = logging.getLogger("rag")
 
@@ -48,6 +50,10 @@ JWT_ISSUER = os.environ.get("JWT_ISSUER", "").strip() or None
 _DEV_JWT_SECRET = "dev-jwt-secret-do-not-use-in-production"
 JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", str(60 * 24 * 7)))
 AUTH_COOKIE_NAME = "access_token"
+ASSISTANT_UNAVAILABLE_DETAIL = (
+    "Assistant unavailable (model/embeddings failed to load). "
+    "On low-memory hosts set LLM_PROVIDER=hf_space or RAG_REMOTE_LLM_URL."
+)
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PBKDF2_ITERATIONS = 210_000
 
@@ -831,12 +837,30 @@ def list_messages(
     return [to_message_response(m) for m in items_chrono]
 
 
-@app.post("/sessions/{session_id}/messages")
-def send_message(
+@dataclass
+class _TurnContext:
+    """State shared by the JSON and streaming chat endpoints, built before generation starts."""
+
+    session: ChatSessionModel
+    assistant: RAGAssistant
+    user_message: ChatMessageModel
+    user_text: str
+    prev_summary: str
+    recent_messages: List[Dict[str, str]]
+    active_context: str
+    detailed_ctx: str
+    manual_ids: List[str]
+    merged_vid: str
+    payload_vehicle_id: str
+    session_title: str | None
+
+
+def _prepare_turn(
     session_id: str,
     payload: ChatMessageRequest,
-    user_id: Annotated[str, Depends(get_current_user_id)],
-) -> Dict[str, Any]:
+    user_id: str,
+) -> _TurnContext:
+    """Persist the user message and resolve everything the assistant needs to answer."""
     text = payload.message.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -866,7 +890,7 @@ def send_message(
                 select(ChatMessageModel)
                 .where(ChatMessageModel.session_id == session_id)
                 .order_by(desc(ChatMessageModel.created_at), desc(ChatMessageModel.id))
-                .limit(4)
+                .limit(HISTORY_MESSAGES)
             ).all()
         )
         recent_rows = list(reversed(recent_rows))
@@ -898,25 +922,29 @@ def send_message(
             car_context=active_context,
             use_user_manual=payload.use_user_manual,
         )
-        answer = assistant.generate_answer(
-            text,
-            car_context=active_context,
-            priority_context=detailed_ctx,
-            manual_ids=manual_ids,
-            chat_summary=prev_summary,
-            recent_messages=recent_messages,
-        )
     except RuntimeError as exc:
         # Typical on Render: local LLM weights failed to load (set LLM_PROVIDER=hf_space or RAG_REMOTE_LLM_URL).
         logger.exception("RAG assistant failed: %s", exc)
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Assistant unavailable (model/embeddings failed to load). "
-                "On low-memory hosts set LLM_PROVIDER=hf_space or RAG_REMOTE_LLM_URL."
-            ),
-        ) from exc
+        raise HTTPException(status_code=503, detail=ASSISTANT_UNAVAILABLE_DETAIL) from exc
 
+    return _TurnContext(
+        session=session,
+        assistant=assistant,
+        user_message=user_message,
+        user_text=text,
+        prev_summary=prev_summary,
+        recent_messages=recent_messages,
+        active_context=active_context,
+        detailed_ctx=detailed_ctx,
+        manual_ids=manual_ids,
+        merged_vid=merged_vid,
+        payload_vehicle_id=payload_vehicle_id,
+        session_title=session_title,
+    )
+
+
+def _persist_turn(ctx: _TurnContext, session_id: str, answer: str) -> Dict[str, Any]:
+    """Store the assistant reply and roll the session forward. Mirrors the pre-streaming behaviour."""
     with SessionLocal() as db:
         assistant_message = ChatMessageModel(
             id=str(uuid.uuid4()),
@@ -930,26 +958,106 @@ def send_message(
         session_to_update = db.get(ChatSessionModel, session_id)
         if session_to_update is not None:
             session_to_update.updated_at = utcnow()
-            if active_context:
-                session_to_update.car_context = _shorten_context(active_context)
+            if ctx.active_context:
+                session_to_update.car_context = _shorten_context(ctx.active_context)
             # Rolling summary: update once per assistant reply.
             try:
-                session_to_update.chat_summary = assistant.update_chat_summary(prev_summary, text, answer)
+                session_to_update.chat_summary = ctx.assistant.update_chat_summary(
+                    ctx.prev_summary, ctx.user_text, answer
+                )
             except Exception:
                 pass
-            if payload_vehicle_id:
-                session_to_update.vehicle_id = payload_vehicle_id
-            elif merged_vid and not (session_to_update.vehicle_id or "").strip():
-                session_to_update.vehicle_id = merged_vid
-            if session_title:
-                session_to_update.title = session_title
+            if ctx.payload_vehicle_id:
+                session_to_update.vehicle_id = ctx.payload_vehicle_id
+            elif ctx.merged_vid and not (session_to_update.vehicle_id or "").strip():
+                session_to_update.vehicle_id = ctx.merged_vid
+            if ctx.session_title:
+                session_to_update.title = ctx.session_title
 
         db.commit()
         db.refresh(assistant_message)
         refreshed_session = db.get(ChatSessionModel, session_id)
 
     return {
-        "session": to_session_response(refreshed_session if refreshed_session is not None else session),
-        "user_message": to_message_response(user_message),
+        "session": to_session_response(
+            refreshed_session if refreshed_session is not None else ctx.session
+        ),
+        "user_message": to_message_response(ctx.user_message),
         "assistant_message": to_message_response(assistant_message),
     }
+
+
+@app.post("/sessions/{session_id}/messages")
+def send_message(
+    session_id: str,
+    payload: ChatMessageRequest,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+) -> Dict[str, Any]:
+    ctx = _prepare_turn(session_id, payload, user_id)
+    try:
+        answer = ctx.assistant.generate_answer(
+            ctx.user_text,
+            car_context=ctx.active_context,
+            priority_context=ctx.detailed_ctx,
+            manual_ids=ctx.manual_ids,
+            chat_summary=ctx.prev_summary,
+            recent_messages=ctx.recent_messages,
+        )
+    except RuntimeError as exc:
+        logger.exception("RAG assistant failed: %s", exc)
+        raise HTTPException(status_code=503, detail=ASSISTANT_UNAVAILABLE_DETAIL) from exc
+
+    return _persist_turn(ctx, session_id, answer)
+
+
+def _sse(event: str, data: Any) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+@app.post("/sessions/{session_id}/messages/stream")
+def stream_message(
+    session_id: str,
+    payload: ChatMessageRequest,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+) -> StreamingResponse:
+    """Server-sent events variant of `send_message`.
+
+    Emits `delta` events as the model writes, then a single `done` event carrying the same body
+    the JSON endpoint returns. Deltas are provisional — answer post-processing can rewrite or
+    replace the reply — so clients should render the `done` text in place of accumulated deltas.
+    """
+    ctx = _prepare_turn(session_id, payload, user_id)
+
+    def event_stream():
+        try:
+            final_answer = ""
+            for kind, chunk in ctx.assistant.generate_answer_stream(
+                ctx.user_text,
+                car_context=ctx.active_context,
+                priority_context=ctx.detailed_ctx,
+                manual_ids=ctx.manual_ids,
+                chat_summary=ctx.prev_summary,
+                recent_messages=ctx.recent_messages,
+            ):
+                if kind == "delta":
+                    yield _sse("delta", {"text": chunk})
+                else:
+                    final_answer = chunk
+            body = _persist_turn(ctx, session_id, final_answer)
+            yield _sse("done", {k: v.model_dump(mode="json") for k, v in body.items()})
+        except Exception as exc:
+            # The response has already started, so the status code cannot change; report in-band.
+            logger.exception("Streaming chat failed: %s", exc)
+            dbg = os.environ.get("RAG_DEBUG", "").strip().lower() in ("1", "true", "yes")
+            yield _sse("error", {"detail": str(exc) if dbg else ASSISTANT_UNAVAILABLE_DETAIL})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Stops nginx and similar proxies from buffering the stream into one response.
+            "X-Accel-Buffering": "no",
+        },
+    )
