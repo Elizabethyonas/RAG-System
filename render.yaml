@@ -2,7 +2,7 @@ services:
   - type: web
     name: rag-system-api
     env: python
-    plan: starter
+    plan: free
     autoDeploy: true
     region: frankfurt
     buildCommand: pip install -r requirements.txt
