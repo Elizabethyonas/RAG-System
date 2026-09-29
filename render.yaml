@@ -5,7 +5,7 @@ services:
     plan: free
     autoDeploy: true
     region: frankfurt
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python scripts/download_minilm_onnx.py
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
@@ -17,6 +17,12 @@ services:
         value: HS256
       - key: RAG_KB_BACKEND
         value: pgvector
+      - key: RAG_EMBED_BACKEND
+        value: onnx
+      - key: LLM_PROVIDER
+        value: hf_space
+      - key: HF_SPACE_ID
+        value: Heranite/RAG_system
       - key: PYTHON_VERSION
         value: 3.13.0
       - key: MALLOC_ARENA_MAX

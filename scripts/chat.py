@@ -85,12 +85,31 @@ _hf_space_client_lock_target: str | None = None
 _hf_space_client_singleton: Client | None = None
 
 
+def _on_render() -> bool:
+    return os.environ.get("RENDER", "").strip().lower() == "true"
+
+
+def _use_onnx_embedder() -> bool:
+    """Torch-free embeddings on Render. Local Mac keeps SentenceTransformer."""
+    choice = os.environ.get("RAG_EMBED_BACKEND", "auto").strip().lower()
+    if choice in ("onnx", "ort"):
+        return True
+    if choice in ("sentence_transformers", "st", "torch"):
+        return False
+    return _on_render()
+
+
 def _get_shared_sentence_transformer():
     global _shared_sentence_transformer
     if _shared_sentence_transformer is None:
-        from sentence_transformers import SentenceTransformer
+        if _use_onnx_embedder():
+            from minilm_onnx import OnnxMiniLM
 
-        _shared_sentence_transformer = SentenceTransformer(EMBEDDING_MODEL)
+            _shared_sentence_transformer = OnnxMiniLM()
+        else:
+            from sentence_transformers import SentenceTransformer
+
+            _shared_sentence_transformer = SentenceTransformer(EMBEDDING_MODEL)
     return _shared_sentence_transformer
 
 
@@ -110,6 +129,10 @@ FALLBACK_LLM_MODEL = os.environ.get(
 REMOTE_LLM_URL = os.environ.get("RAG_REMOTE_LLM_URL", "").strip()
 REMOTE_LLM_SECRET = os.environ.get("RAG_REMOTE_LLM_SECRET", "").strip()
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "").strip().lower()
+# A git deploy does not update dashboard env vars. On Render, default to the
+# Hugging Face Space so a chat request never falls through to a local Qwen load.
+if not LLM_PROVIDER and os.environ.get("RENDER", "").strip().lower() == "true":
+    LLM_PROVIDER = "hf_space"
 
 # llama.cpp (GGUF) path. Quantised weights run several times faster than fp16 transformers on
 # CPU, which matters on Intel Macs where torch is capped at 2.2.x and the Metal backend is slower
@@ -119,6 +142,13 @@ GGUF_THREADS = int(os.environ.get("RAG_GGUF_THREADS", "0") or 0) or (os.cpu_coun
 GGUF_CONTEXT = int(os.environ.get("RAG_GGUF_CONTEXT", "4096") or 4096)
 HF_SPACE_ID = os.environ.get("HF_SPACE_ID", "").strip()
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "").strip()
+if (
+    not HF_SPACE_ID
+    and not HF_SPACE_URL
+    and LLM_PROVIDER == "hf_space"
+    and os.environ.get("RENDER", "").strip().lower() == "true"
+):
+    HF_SPACE_ID = "Heranite/RAG_system"
 HF_SPACE_API_NAME = os.environ.get("HF_SPACE_API_NAME", "/predict").strip() or "/predict"
 
 # Increase Hub network timeouts to reduce transient download failures.
@@ -497,9 +527,12 @@ class RAGAssistant:
         self.hf_space_id = HF_SPACE_ID
         self.hf_space_url = HF_SPACE_URL
         self.hf_space_api_name = HF_SPACE_API_NAME
-        self.use_gguf = use_gguf_llm()
+        self.use_gguf = use_gguf_llm() and not _on_render()
         # Remote generation does not need torch. Loading it here OOMs the 512 MB Render instance.
-        if self.llm_provider == "hf_space" or self.remote_llm_url or self.use_gguf:
+        remote_generation = (
+            self.llm_provider == "hf_space" or bool(self.remote_llm_url) or self.use_gguf or _on_render()
+        )
+        if remote_generation:
             self.device = "cpu"
         else:
             self.device = get_llm_device()
@@ -509,6 +542,11 @@ class RAGAssistant:
             self.active_llm_model = f"hf_space:{target}"
             self.llm = None
             self.tokenizer = None
+        elif _on_render():
+            raise RuntimeError(
+                "Render's free instance cannot load a local LLM (512 MB). "
+                "Set LLM_PROVIDER=hf_space and HF_SPACE_ID, or set RAG_REMOTE_LLM_URL."
+            )
         elif self.use_gguf:
             # Skips the transformers weights entirely; llama.cpp owns tokenisation too.
             self.active_llm_model = f"llama_cpp:{Path(GGUF_MODEL_PATH).name}"
