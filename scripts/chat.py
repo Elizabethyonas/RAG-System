@@ -22,21 +22,23 @@ if str(_ROOT) not in sys.path:
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-import torch
-
-# OpenMP stays pinned to one thread (see above), but torch's own intra-op pool is safe to widen
-# and generation is several times faster for it. Set RAG_TORCH_THREADS=1 to restore the old
-# single-threaded behaviour.
-_torch_threads = int(os.environ.get("RAG_TORCH_THREADS", "0") or 0) or (os.cpu_count() or 1)
-torch.set_num_threads(max(1, _torch_threads))
-
-import faiss
 import numpy as np
 from gradio_client import Client
-from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 from database import RagUserProfileModel, SessionLocal
+
+
+def _import_torch():
+    """Import torch only when a local model needs it.
+
+    Render's free instance has 512 MB. Importing torch while the server starts
+    gets the process killed, and the proxy returns Bad Gateway.
+    """
+    import torch
+
+    threads = int(os.environ.get("RAG_TORCH_THREADS", "0") or 0) or (os.cpu_count() or 1)
+    torch.set_num_threads(max(1, threads))
+    return torch
 
 
 def _patch_transformers_mps_isin() -> None:
@@ -45,6 +47,7 @@ def _patch_transformers_mps_isin() -> None:
     ``isin_mps_friendly`` indexes ``test_elements.shape[0]``. A 0-dim pad token has no
     dimension 0, so ``generate()`` raises IndexError and the chat request returns 500.
     """
+    import torch
     import transformers.generation.utils as gen_utils
     import transformers.pytorch_utils as pt_utils
 
@@ -62,8 +65,6 @@ def _patch_transformers_mps_isin() -> None:
     gen_utils.isin_mps_friendly = isin_mps_friendly
 
 
-_patch_transformers_mps_isin()
-
 from rag_kb import count_user_chunks, kb_pgvector_enabled, search_kb_l2
 
 warnings.filterwarnings(
@@ -79,14 +80,16 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 # One shared model/client for all RAGAssistant instances — critical on low-RAM hosts (e.g. Render Free),
 # where caching assistants per user/context would load SentenceTransformer repeatedly and OOM → 502.
-_shared_sentence_transformer: SentenceTransformer | None = None
+_shared_sentence_transformer: object | None = None
 _hf_space_client_lock_target: str | None = None
 _hf_space_client_singleton: Client | None = None
 
 
-def _get_shared_sentence_transformer() -> SentenceTransformer:
+def _get_shared_sentence_transformer():
     global _shared_sentence_transformer
     if _shared_sentence_transformer is None:
+        from sentence_transformers import SentenceTransformer
+
         _shared_sentence_transformer = SentenceTransformer(EMBEDDING_MODEL)
     return _shared_sentence_transformer
 
@@ -138,7 +141,7 @@ def use_pgvector_for_kb() -> bool:
     return kb_pgvector_enabled()
 
 
-def load_faiss_and_docs(index_path: str, docs_path: str) -> tuple[faiss.Index, List[str]]:
+def load_faiss_and_docs(index_path: str, docs_path: str) -> tuple[object, List[str]]:
     if not os.path.exists(index_path):
         raise FileNotFoundError(
             f"Missing FAISS index: {index_path}. Run the index builder first."
@@ -147,6 +150,8 @@ def load_faiss_and_docs(index_path: str, docs_path: str) -> tuple[faiss.Index, L
         raise FileNotFoundError(
             f"Missing docs file: {docs_path}. Run the index builder first."
         )
+
+    import faiss
 
     index = faiss.read_index(index_path)
     with open(docs_path, "r", encoding="utf-8") as f:
@@ -196,6 +201,7 @@ def get_llm_device() -> str:
     single-threaded (OpenMP is pinned to 1 to avoid a macOS crash) and takes
     minutes per reply. Set RAG_USE_MPS=0 to force CPU.
     """
+    torch = _import_torch()
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -260,6 +266,10 @@ def _get_shared_local_llm(device: str) -> tuple[str, object, object]:
         if _shared_local_llm is not None and _shared_local_llm[1] == device:
             name, _, tokenizer, model = _shared_local_llm
             return name, tokenizer, model
+
+        torch = _import_torch()
+        _patch_transformers_mps_isin()
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         if device == "cuda":
             torch_dtype = torch.float16
@@ -487,8 +497,12 @@ class RAGAssistant:
         self.hf_space_id = HF_SPACE_ID
         self.hf_space_url = HF_SPACE_URL
         self.hf_space_api_name = HF_SPACE_API_NAME
-        self.device = get_llm_device()
         self.use_gguf = use_gguf_llm()
+        # Remote generation does not need torch. Loading it here OOMs the 512 MB Render instance.
+        if self.llm_provider == "hf_space" or self.remote_llm_url or self.use_gguf:
+            self.device = "cpu"
+        else:
+            self.device = get_llm_device()
 
         if self.llm_provider == "hf_space":
             target = self.hf_space_id or self.hf_space_url or "(missing HF_SPACE_ID/HF_SPACE_URL)"
@@ -888,6 +902,8 @@ Updated summary:
             else:
                 assert self.llm is not None
                 assert self.tokenizer is not None
+                import torch
+
                 inputs, input_len = self._tokenize_for_generation(prompt)
                 with torch.no_grad():
                     outputs = self.llm.generate(
@@ -985,7 +1001,7 @@ Updated summary:
             out += "."
         return out
 
-    def _tokenize_for_generation(self, prompt: str) -> tuple[dict[str, torch.Tensor], int]:
+    def _tokenize_for_generation(self, prompt: str) -> tuple[dict, int]:
         if self.remote_llm_url or self.llm_provider == "hf_space":
             raise RuntimeError("Tokenization is not used when a remote LLM provider is configured.")
         messages = [{"role": "user", "content": prompt}]
@@ -1199,6 +1215,8 @@ Updated summary:
         else:
             assert self.llm is not None
             assert self.tokenizer is not None
+            import torch
+
             inputs, input_len = self._tokenize_for_generation(plan.prompt)
 
             with torch.no_grad():
@@ -1274,6 +1292,9 @@ Updated summary:
 
         assert self.llm is not None
         assert self.tokenizer is not None
+        import torch
+        from transformers import TextIteratorStreamer
+
         inputs, _ = self._tokenize_for_generation(plan.prompt)
         streamer = TextIteratorStreamer(
             self.tokenizer, skip_prompt=True, skip_special_tokens=True

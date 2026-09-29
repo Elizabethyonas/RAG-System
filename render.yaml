@@ -19,3 +19,9 @@ services:
         value: pgvector
       - key: PYTHON_VERSION
         value: 3.13.0
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: WEB_CONCURRENCY
+        value: "1"
