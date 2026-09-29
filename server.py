@@ -54,6 +54,11 @@ ASSISTANT_UNAVAILABLE_DETAIL = (
     "Assistant unavailable (model/embeddings failed to load). "
     "On low-memory hosts set LLM_PROVIDER=hf_space or RAG_REMOTE_LLM_URL."
 )
+
+
+def _assistant_error_detail(exc: BaseException) -> str:
+    message = str(exc).strip()
+    return message[:800] if message else ASSISTANT_UNAVAILABLE_DETAIL
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PBKDF2_ITERATIONS = 210_000
 
@@ -925,7 +930,7 @@ def _prepare_turn(
     except RuntimeError as exc:
         # Typical on Render: local LLM weights failed to load (set LLM_PROVIDER=hf_space or RAG_REMOTE_LLM_URL).
         logger.exception("RAG assistant failed: %s", exc)
-        raise HTTPException(status_code=503, detail=ASSISTANT_UNAVAILABLE_DETAIL) from exc
+        raise HTTPException(status_code=503, detail=_assistant_error_detail(exc)) from exc
 
     return _TurnContext(
         session=session,
@@ -1005,7 +1010,7 @@ def send_message(
         )
     except RuntimeError as exc:
         logger.exception("RAG assistant failed: %s", exc)
-        raise HTTPException(status_code=503, detail=ASSISTANT_UNAVAILABLE_DETAIL) from exc
+        raise HTTPException(status_code=503, detail=_assistant_error_detail(exc)) from exc
 
     return _persist_turn(ctx, session_id, answer)
 
@@ -1049,7 +1054,7 @@ def stream_message(
             # The response has already started, so the status code cannot change; report in-band.
             logger.exception("Streaming chat failed: %s", exc)
             dbg = os.environ.get("RAG_DEBUG", "").strip().lower() in ("1", "true", "yes")
-            yield _sse("error", {"detail": str(exc) if dbg else ASSISTANT_UNAVAILABLE_DETAIL})
+            yield _sse("error", {"detail": str(exc) if dbg else _assistant_error_detail(exc)})
 
     return StreamingResponse(
         event_stream(),

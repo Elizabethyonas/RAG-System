@@ -23,6 +23,8 @@ services:
         value: hf_space
       - key: HF_SPACE_ID
         value: Heranite/RAG_system
+      - key: HF_SPACE_API_NAME
+        value: /generate
       - key: PYTHON_VERSION
         value: 3.13.0
       - key: MALLOC_ARENA_MAX

@@ -149,7 +149,8 @@ if (
     and os.environ.get("RENDER", "").strip().lower() == "true"
 ):
     HF_SPACE_ID = "Heranite/RAG_system"
-HF_SPACE_API_NAME = os.environ.get("HF_SPACE_API_NAME", "/predict").strip() or "/predict"
+# The Space exposes Gradio api_name="generate", not /predict.
+HF_SPACE_API_NAME = os.environ.get("HF_SPACE_API_NAME", "/generate").strip() or "/generate"
 
 # Increase Hub network timeouts to reduce transient download failures.
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
@@ -1110,10 +1111,19 @@ Updated summary:
         if not target:
             raise RuntimeError("LLM_PROVIDER=hf_space requires HF_SPACE_ID or HF_SPACE_URL.")
         client = _get_hf_space_client(target)
-        try:
-            result = client.predict(prompt=prompt, api_name=self.hf_space_api_name)
-        except Exception as e:  # pragma: no cover - network/runtime dependent
-            raise RuntimeError(f"HF Space generation failed: {e}") from e
+        api_names = [self.hf_space_api_name]
+        if "/generate" not in api_names:
+            api_names.append("/generate")
+        result = None
+        errors: List[str] = []
+        for api_name in api_names:
+            try:
+                result = client.predict(prompt=prompt, api_name=api_name)
+                break
+            except Exception as e:  # pragma: no cover - network/runtime dependent
+                errors.append(f"{api_name}: {e}")
+        else:
+            raise RuntimeError("HF Space generation failed: " + " | ".join(errors))
 
         if isinstance(result, str):
             text = result.strip()
