@@ -850,6 +850,30 @@ Question:
 Answer:
 """.strip()
 
+    def _build_remote_prompt(self, context: str, query: str) -> str:
+        """Short TinyLlama chat prompt.
+
+        The Space generates until EOS or 120 tokens, whichever comes first, and
+        returns only the text after the last ``Answer:``. A long persona makes
+        every reply wait on CPU prefill, so this stays small and ends in the
+        chat format TinyLlama was trained to stop after.
+        """
+        clipped = " ".join(context.split())
+        if len(clipped) > 700:
+            clipped = clipped[:700].rsplit(" ", 1)[0]
+        return (
+            "<|system|>\n"
+            "You are CarCare AI, a safety-first car assistant. "
+            "Answer in under 80 words. Use only the notes below. "
+            "If brakes, steering, smoke, fuel smell, or overheating are involved, "
+            "tell the driver to stop and get a mechanic.</s>\n"
+            "<|user|>\n"
+            f"{clipped}\n\n"
+            f"Question: {query.strip()}</s>\n"
+            "<|assistant|>\n"
+            "Answer:"
+        )
+
     def _format_recent_messages(self, recent_messages: Sequence[Dict[str, str]] | None) -> str:
         if not recent_messages:
             return ""
@@ -902,15 +926,18 @@ Answer:
         """
         Rolling summary for long chats.
 
-        Remote providers still use the LLM. A local model does not: a second
-        generation was running before the HTTP response and added minutes.
+        The Hugging Face Space and a local model both skip a second generation.
+        That extra call ran before the HTTP response and roughly doubled every reply.
         """
         prev = (prev_summary or "").strip()
         u = (user_text or "").strip()
         a = (assistant_text or "").strip()
         if not u and not a:
             return prev[:1400]
-        if self.llm is not None or self.use_gguf:
+        # The Hugging Face Space is a free CPU and always generates a full reply.
+        # A second call to summarize the turn runs before the HTTP response and
+        # roughly doubles every message. The local heuristic is instant.
+        if self.llm is not None or self.use_gguf or self.llm_provider == "hf_space":
             return self._heuristic_chat_summary(prev, u, a)
 
         prompt = f"""
@@ -1197,22 +1224,33 @@ Updated summary:
             if not context_chunks
             else "\n".join(context_chunks)
         )
-        context = manual_block[:2500]
         convo_prefix = self._compose_conversation_prefix(
             chat_summary=chat_summary,
             recent_messages=recent_messages,
         )
-        if convo_prefix:
-            context = f"{convo_prefix}\n\n{context}".strip()
-        if snap:
-            context = (
-                f"(Vehicle profile snapshot — factual vehicle state)\n{snap[:2400]}\n\n"
-                f"(Owner manual excerpts)\n{context}"
-            )
-        if active_context:
-            context = f"(Vehicle focus: {active_context[:300]})\n\n{context}"
-        mode = self._answer_mode(query)
-        prompt = self._build_prompt(context=context, query=query, mode=mode)
+        if self.llm_provider == "hf_space":
+            bits: List[str] = []
+            if active_context:
+                bits.append(f"Vehicle: {active_context[:100]}")
+            if snap:
+                bits.append(snap[:180])
+            if convo_prefix:
+                bits.append(convo_prefix[-200:])
+            bits.append(manual_block[:450])
+            prompt = self._build_remote_prompt(context="\n".join(bits), query=query)
+        else:
+            context = manual_block[:2500]
+            if convo_prefix:
+                context = f"{convo_prefix}\n\n{context}".strip()
+            if snap:
+                context = (
+                    f"(Vehicle profile snapshot — factual vehicle state)\n{snap[:2400]}\n\n"
+                    f"(Owner manual excerpts)\n{context}"
+                )
+            if active_context:
+                context = f"(Vehicle focus: {active_context[:300]})\n\n{context}"
+            mode = self._answer_mode(query)
+            prompt = self._build_prompt(context=context, query=query, mode=mode)
 
         return _AnswerPlan(
             prompt=prompt,
