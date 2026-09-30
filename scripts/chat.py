@@ -140,6 +140,11 @@ if not LLM_PROVIDER and os.environ.get("RENDER", "").strip().lower() == "true":
 GGUF_MODEL_PATH = os.environ.get("RAG_GGUF_MODEL", "").strip()
 GGUF_THREADS = int(os.environ.get("RAG_GGUF_THREADS", "0") or 0) or (os.cpu_count() or 4)
 GGUF_CONTEXT = int(os.environ.get("RAG_GGUF_CONTEXT", "4096") or 4096)
+# Qwen2.5 on this Space applies its own chat template. The older TinyLlama Space
+# was told to answer only from retrieved notes, so the chat repeated manual excerpts.
+QWEN_SPACE_ID = "Elizabetyonas/rag-qwen"
+LEGACY_TINYLLAMA_SPACE_ID = "Heranite/RAG_system"
+
 HF_SPACE_ID = os.environ.get("HF_SPACE_ID", "").strip()
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "").strip()
 if (
@@ -148,9 +153,12 @@ if (
     and LLM_PROVIDER == "hf_space"
     and os.environ.get("RENDER", "").strip().lower() == "true"
 ):
-    HF_SPACE_ID = "Heranite/RAG_system"
-# The Space exposes Gradio api_name="generate", not /predict.
+    HF_SPACE_ID = QWEN_SPACE_ID
 HF_SPACE_API_NAME = os.environ.get("HF_SPACE_API_NAME", "/generate").strip() or "/generate"
+if HF_SPACE_ID == LEGACY_TINYLLAMA_SPACE_ID and not HF_SPACE_URL:
+    HF_SPACE_ID = QWEN_SPACE_ID
+    if HF_SPACE_API_NAME in {"/generate", "generate"}:
+        HF_SPACE_API_NAME = "/predict"
 
 # Increase Hub network timeouts to reduce transient download failures.
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
@@ -503,6 +511,133 @@ def _is_identity_or_meta_query(query: str) -> bool:
     return any(re.search(p, q) for p in patterns)
 
 
+# Words that mean the user is asking about a vehicle. Anything else is sent to the
+# Space as the question itself, the same way the Hugging Face prompt box works.
+_VEHICLE_QUERY_WORDS = {
+    "abs",
+    "airbag",
+    "alternator",
+    "battery",
+    "brake",
+    "brakes",
+    "car",
+    "cars",
+    "clutch",
+    "coolant",
+    "dashboard",
+    "diesel",
+    "engine",
+    "exhaust",
+    "fuel",
+    "gear",
+    "headlight",
+    "horsepower",
+    "leak",
+    "maintenance",
+    "manual",
+    "mileage",
+    "oil",
+    "overheat",
+    "petrol",
+    "pickup",
+    "radiator",
+    "rpm",
+    "sedan",
+    "service",
+    "smoke",
+    "steering",
+    "suv",
+    "suspension",
+    "tire",
+    "tires",
+    "torque",
+    "transmission",
+    "tyre",
+    "tyres",
+    "vehicle",
+    "wheel",
+    "wheels",
+    "wiper",
+    "wishbone",
+}
+_VEHICLE_QUERY_PHRASES = (
+    "air conditioning",
+    "check engine",
+    "turn signal",
+    "warning light",
+)
+_NOTE_STOPWORDS = {
+    "about",
+    "and",
+    "are",
+    "can",
+    "change",
+    "could",
+    "did",
+    "does",
+    "for",
+    "from",
+    "have",
+    "has",
+    "how",
+    "into",
+    "often",
+    "please",
+    "should",
+    "tell",
+    "that",
+    "the",
+    "this",
+    "want",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "would",
+    "you",
+    "your",
+}
+
+
+def _is_vehicle_query(query: str) -> bool:
+    q = _normalize_chat_query(query)
+    tokens = set(q.split())
+    if tokens & _VEHICLE_QUERY_WORDS:
+        return True
+    return any(phrase in q for phrase in _VEHICLE_QUERY_PHRASES)
+
+
+def _content_words(text: str) -> set[str]:
+    return {
+        word
+        for word in _normalize_chat_query(text).split()
+        if len(word) > 2 and word not in _NOTE_STOPWORDS
+    }
+
+
+def _relevant_manual_notes(query: str, chunks: Sequence[str]) -> str:
+    """Keep manual excerpts that share real words with the question.
+
+    Nearest-neighbor search often returns a vehicle spec sheet for an unrelated
+    question. Those excerpts are what the model was quoting instead of answering.
+    """
+    query_words = _content_words(query)
+    kept: List[str] = []
+    for chunk in chunks:
+        if query_words and not (_content_words(chunk) & query_words):
+            continue
+        text = " ".join(chunk.split())
+        if text and text not in kept:
+            kept.append(text)
+    notes = "\n".join(kept)
+    if len(notes) > 500:
+        notes = notes[:500].rsplit(" ", 1)[0]
+    return notes.strip()
+
+
 class RAGAssistant:
     def __init__(
         self,
@@ -850,25 +985,69 @@ Question:
 Answer:
 """.strip()
 
+    def _hf_space_uses_plain_prompt(self) -> bool:
+        """True when the Space wraps our string as one user message (Qwen).
+
+        TinyLlama tokens inside that string are ordinary text, so the model
+        treats the manual notes as the thing it should continue.
+        """
+        target = (self.hf_space_id or self.hf_space_url).lower()
+        api = self.hf_space_api_name.lower().strip().rstrip("/")
+        return "qwen" in target or api.endswith("predict")
+
+    def _build_qwen_space_prompt(self, notes: str, query: str, vehicle: str) -> str:
+        """Prompt for a Space that applies Qwen's chat template itself.
+
+        A question with no supporting notes is sent unchanged, matching the
+        Hugging Face prompt box. Notes are optional background, not the answer.
+        """
+        query = query.strip()
+        notes = notes.strip()
+        vehicle = vehicle.strip()[:120]
+        if not notes and not vehicle:
+            return query
+        if not notes:
+            return (
+                "Answer the question directly. "
+                f"The vehicle is {vehicle}. "
+                "If you are unsure of a model-specific figure, say so.\n\n"
+                f"Question: {query}"
+            )
+        vehicle_line = f"The vehicle is {vehicle}.\n" if vehicle else ""
+        return (
+            "Answer the question directly. "
+            "You are CarCare AI, a safety-first car assistant. "
+            "Use the notes only when they directly answer the question. "
+            "If they do not, ignore them and answer the question yourself. "
+            "Do not quote unrelated specifications. "
+            "If brakes, steering, smoke, fuel smell, or overheating are involved, "
+            "tell the driver to stop and get a mechanic.\n\n"
+            f"{vehicle_line}"
+            f"Notes:\n{notes}\n\n"
+            f"Question: {query}"
+        )
+
     def _build_remote_prompt(self, context: str, query: str) -> str:
         """Short TinyLlama chat prompt.
 
-        The Space generates until EOS or 120 tokens, whichever comes first, and
-        returns only the text after the last ``Answer:``. A long persona makes
-        every reply wait on CPU prefill, so this stays small and ends in the
-        chat format TinyLlama was trained to stop after.
+        That Space generates until EOS or 120 tokens and returns only the text
+        after the last ``Answer:``. The question stays the thing to answer;
+        notes are used only when they actually contain the answer.
         """
         clipped = " ".join(context.split())
         if len(clipped) > 700:
             clipped = clipped[:700].rsplit(" ", 1)[0]
+        notes = f"Notes:\n{clipped}\n\n" if clipped else ""
         return (
             "<|system|>\n"
             "You are CarCare AI, a safety-first car assistant. "
-            "Answer in under 80 words. Use only the notes below. "
+            "Answer the user's question directly in under 80 words. "
+            "Use the notes only if they answer the question. "
+            "If they do not, ignore them. "
             "If brakes, steering, smoke, fuel smell, or overheating are involved, "
             "tell the driver to stop and get a mechanic.</s>\n"
             "<|user|>\n"
-            f"{clipped}\n\n"
+            f"{notes}"
             f"Question: {query.strip()}</s>\n"
             "<|assistant|>\n"
             "Answer:"
@@ -1138,9 +1317,10 @@ Updated summary:
         if not target:
             raise RuntimeError("LLM_PROVIDER=hf_space requires HF_SPACE_ID or HF_SPACE_URL.")
         client = _get_hf_space_client(target)
-        api_names = [self.hf_space_api_name]
-        if "/generate" not in api_names:
-            api_names.append("/generate")
+        api_names: List[str] = []
+        for name in (self.hf_space_api_name, "/predict", "/generate"):
+            if name and name not in api_names:
+                api_names.append(name)
         result = None
         errors: List[str] = []
         for api_name in api_names:
@@ -1212,6 +1392,15 @@ Updated summary:
                 )
             )
 
+        # The Qwen Space answers a bare question the same way its prompt box does.
+        # Retrieval runs only for vehicle questions, and only matching notes are kept.
+        if self.llm_provider == "hf_space" and self._hf_space_uses_plain_prompt() and not _is_vehicle_query(query):
+            return _AnswerPlan(
+                prompt=query.strip(),
+                snap=snap,
+                active_context=active_context,
+            )
+
         context_chunks = self.retrieve(
             query,
             config=RetrievalConfig(k_user=2, k_global=3),
@@ -1228,15 +1417,22 @@ Updated summary:
             chat_summary=chat_summary,
             recent_messages=recent_messages,
         )
-        if self.llm_provider == "hf_space":
+        if self.llm_provider == "hf_space" and self._hf_space_uses_plain_prompt():
+            notes = _relevant_manual_notes(query, context_chunks)
+            prompt = self._build_qwen_space_prompt(
+                notes=notes,
+                query=query,
+                vehicle=active_context,
+            )
+        elif self.llm_provider == "hf_space":
             bits: List[str] = []
             if active_context:
                 bits.append(f"Vehicle: {active_context[:100]}")
             if snap:
                 bits.append(snap[:180])
-            if convo_prefix:
-                bits.append(convo_prefix[-200:])
-            bits.append(manual_block[:450])
+            notes = _relevant_manual_notes(query, context_chunks)
+            if notes:
+                bits.append(notes[:450])
             prompt = self._build_remote_prompt(context="\n".join(bits), query=query)
         else:
             context = manual_block[:2500]
